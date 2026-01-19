@@ -1,0 +1,94 @@
+# This is a basic workflow to help you get started with Actions
+
+name: docs.koinize.com-CEPH
+
+# Controls when the action will run. 
+on:
+  # Triggers the workflow on push or pull request events but only for the master branch
+  push:
+    branches: [ main ]
+    paths:
+      - 'content/**'
+  pull_request:
+    branches: [ main ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  build:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+            submodules: true  # Fetch Hugo themes
+            fetch-depth: 0    # Fetch all history for .GitInfo and .Lastmod
+
+      # Step 2 - Sets up the latest version of Hugo
+      - name: Setup Hugo
+        uses: peaceiris/actions-hugo@v2
+        with:
+            hugo-version: '0.123.8' # Use 0.111.2 version to avoid URL issues with & character
+            
+      # Also specifies the theme we want to use
+      - name: Build
+        run: hugo --minify
+        
+      # (Recommended) Ensure AWS CLI exists (ubuntu-latest usually has it, but this makes it deterministic)
+      - name: Setup AWS CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v aws >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y awscli
+          fi
+          aws --version
+
+      # --- Ceph S3 sync ---
+      - name: Sync Website to Ceph S3 (aws s3 sync)
+        shell: bash
+        env:
+          AWS_ENDPOINT_URL:       ${{ vars.AWS_ENDPOINT_URL }}
+          AWS_DEFAULT_REGION:     ${{ vars.AWS_DEFAULT_REGION }}
+          AWS_REGION:             ${{ vars.AWS_DEFAULT_REGION }}
+          AWS_S3_FORCE_PATH_STYLE: "true"  # helpful for Ceph; harmless on AWS
+          AWS_ACCESS_KEY_ID:      ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY:  ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+
+          SRC="public"
+          DEST="s3://docs-koinize-com"
+
+          test -d "$SRC" || { echo "Missing build output: $SRC"; exit 1; }
+
+          echo "Syncing: $SRC -> $DEST"
+          aws s3 sync "$SRC" "$DEST" \
+            --endpoint-url "$AWS_ENDPOINT_URL" \
+            --only-show-errors \
+            --delete
+    
+      # --- Final: Purge Bunny CDN cache for the deployed site ---
+      - name: Purge Bunny CDN cache
+        if: success()
+        env:
+          BUNNY_API_KEY: ${{ secrets.BUNNY_API_KEY }}
+          BASE_URL:      "https://docs.koinize.com"
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="${BASE_URL%/}/*"
+          echo "Purging Bunny CDN for: $TARGET"
+          curl -sS -G \
+            -H "X-Api-Key: ${BUNNY_API_KEY}" \
+            --data-urlencode "url=${TARGET}" \
+            "https://api.dynabic.com/bn/purge?async=true" \
+            -D - | sed -n '1,60p'
